@@ -5,7 +5,6 @@ Any parse error stops the program with a clear message indicating
 line number and cause.
 """
 
-from __future__ import annotations
 import re
 from typing import Optional
 from models import Graph, Zone, ZoneType, Connection
@@ -23,7 +22,7 @@ class ParseError(Exception):
 class MapParser:
     """Parses a drone network map file into a Graph.
 
-    Usage:
+    Example:
         graph = MapParser("map.txt").parse()
     """
 
@@ -34,10 +33,6 @@ class MapParser:
         self._has_start = False
         self._has_end = False
         self._nb_drones_set = False
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
 
     def parse(self) -> Graph:
         """Parse the map file and return a populated Graph.
@@ -55,11 +50,15 @@ class MapParser:
         self._validate_completeness()
         return self._graph
 
-    # ------------------------------------------------------------------
-    # File I/O
-    # ------------------------------------------------------------------
-
     def _read_file(self) -> list[str]:
+        """Read all lines from the map file.
+
+        Returns:
+            list[str]: Raw lines including newline characters.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
         try:
             with open(self.filepath, "r") as f:
                 return f.readlines()
@@ -68,15 +67,24 @@ class MapParser:
                 f"Map file not found: '{self.filepath}'"
             )
 
-    # ------------------------------------------------------------------
-    # Line dispatch
-    # ------------------------------------------------------------------
-
     def _process_line(self, raw_line: str, line_num: int) -> None:
+        """Strip and dispatch a single raw line to the appropriate handler.
+
+        Blank lines and lines starting with '#' are silently skipped.
+
+        Raises:
+            ParseError: If the line is unrecognised or violates ordering rules.
+        """
         line = raw_line.strip()
 
         if not line or line.startswith("#"):
             return
+
+        if "#" in line:
+            for i, c in enumerate(line):
+                if c == "#":
+                    line = line[:i]
+                    break
 
         if not self._nb_drones_set and not line.startswith("nb_drones:"):
             raise ParseError(
@@ -98,11 +106,12 @@ class MapParser:
         else:
             raise ParseError(line_num, f"Unrecognized line: '{line}'")
 
-    # ------------------------------------------------------------------
-    # Line handlers
-    # ------------------------------------------------------------------
-
     def _handle_nb_drones(self, line: str, line_num: int) -> None:
+        """Parse and store the nb_drones directive.
+
+        Raises:
+            ParseError: On duplicate definition or non-positive integer.
+        """
         if self._nb_drones_set:
             raise ParseError(line_num, "Duplicate nb_drones definition")
         raw = line[len("nb_drones:"):].strip()
@@ -110,6 +119,11 @@ class MapParser:
             nb = int(raw)
             if nb <= 0:
                 raise ValueError()
+            if 6600 < nb:
+                raise ParseError(
+                    line_num,
+                    f"nb_drones more then 6600, got '{nb}'"
+                )
         except ValueError:
             raise ParseError(
                 line_num,
@@ -119,6 +133,11 @@ class MapParser:
         self._nb_drones_set = True
 
     def _handle_start_hub(self, line: str, line_num: int) -> None:
+        """Parse and register the start hub zone.
+
+        Raises:
+            ParseError: On duplicate start_hub or invalid zone syntax.
+        """
         if self._has_start:
             raise ParseError(line_num, "Duplicate start_hub definition")
         rest = line[len("start_hub:"):].strip()
@@ -129,6 +148,11 @@ class MapParser:
         self._has_start = True
 
     def _handle_end_hub(self, line: str, line_num: int) -> None:
+        """Parse and register the end hub zone.
+
+        Raises:
+            ParseError: On duplicate end_hub or invalid zone syntax.
+        """
         if self._has_end:
             raise ParseError(line_num, "Duplicate end_hub definition")
         rest = line[len("end_hub:"):].strip()
@@ -139,6 +163,11 @@ class MapParser:
         self._has_end = True
 
     def _handle_hub(self, line: str, line_num: int) -> None:
+        """Parse and register an intermediate hub zone.
+
+        Raises:
+            ParseError: On duplicate zone name or invalid zone syntax.
+        """
         rest = line[len("hub:"):].strip()
         zone = self._parse_zone_line(
             rest, line_num, is_start=False, is_end=False
@@ -146,6 +175,11 @@ class MapParser:
         self._add_zone(zone, line_num)
 
     def _handle_connection(self, line: str, line_num: int) -> None:
+        """Parse and register a connection between two zones.
+
+        Raises:
+            ParseError: On duplicate connection or invalid connection syntax.
+        """
         rest = line[len("connection:"):].strip()
         conn = self._parse_connection_line(rest, line_num)
         key = conn.key()
@@ -158,10 +192,6 @@ class MapParser:
         self._seen_connections.add(key)
         self._graph.add_connection(conn)
 
-    # ------------------------------------------------------------------
-    # Zone & connection parsing
-    # ------------------------------------------------------------------
-
     def _parse_zone_line(
         self,
         rest: str,
@@ -169,10 +199,17 @@ class MapParser:
         is_start: bool,
         is_end: bool,
     ) -> Zone:
-        rest, meta = self._extract_metadata(rest, line_num)
+        """Parse zone attributes from the portion after the directive prefix.
 
+        Raises:
+            ParseError: On missing fields, bad coordinates, invalid zone
+                        type, non-positive max_drones, or unknown metadata.
+        """
+        rest, meta = self._extract_metadata(
+            rest, line_num, allow_bracket_names=False
+        )
         parts = rest.split()
-        if len(parts) < 3:
+        if len(parts) != 3:
             raise ParseError(
                 line_num,
                 f"Expected '<name> <x> <y>' but got '{rest}'"
@@ -204,8 +241,12 @@ class MapParser:
             )
 
         color: Optional[str] = meta.get("color", None)
+        if is_start or is_end:
+            max_drones_raw = str(self._graph.nb_drones)
 
-        max_drones_raw = meta.get("max_drones", "1")
+        else:
+            max_drones_raw = meta.get("max_drones", "1")
+
         try:
             max_drones = int(max_drones_raw)
             if max_drones <= 0:
@@ -236,8 +277,15 @@ class MapParser:
         )
 
     def _parse_connection_line(self, rest: str, line_num: int) -> Connection:
-        rest, meta = self._extract_metadata(rest, line_num)
+        """Parse connection attributes from the portion after 'connection:'.
 
+        Raises:
+            ParseError: On bad format, unknown zones, self-loop, non-positive
+                        max_link_capacity, or unknown metadata keys.
+        """
+        rest, meta = self._extract_metadata(
+            rest, line_num, allow_bracket_names=True
+        )
         parts = rest.strip().split()
         if len(parts) != 1:
             raise ParseError(
@@ -246,29 +294,33 @@ class MapParser:
                 f"got '{rest}'"
             )
 
-        dash_parts = parts[0].split("-")
-        if len(dash_parts) != 2:
+        spec = parts[0]
+
+        if spec.count("-") != 1:
             raise ParseError(
                 line_num,
-                f"Connection '{parts[0]}' must contain exactly one dash "
-                f"separating two zone names"
+                f"Connection '{spec}' must contain exactly "
+                f"one dash separating two zone names"
             )
 
-        name_a, name_b = dash_parts
+        name_a, name_b = spec.split("-")
+
         if not name_a or not name_b:
             raise ParseError(
-                line_num, f"Empty zone name in connection '{parts[0]}'"
+                line_num, f"Empty zone name in connection '{spec}'"
             )
 
         zone_a = self._graph.get_zone(name_a)
         if zone_a is None:
             raise ParseError(
-                line_num, f"Unknown zone '{name_a}' referenced in connection"
+                line_num,
+                f"Unknown zone '{name_a}' referenced in connection"
             )
         zone_b = self._graph.get_zone(name_b)
         if zone_b is None:
             raise ParseError(
-                line_num, f"Unknown zone '{name_b}' referenced in connection"
+                line_num,
+                f"Unknown zone '{name_b}' referenced in connection"
             )
         if zone_a is zone_b:
             raise ParseError(
@@ -297,21 +349,39 @@ class MapParser:
 
         return Connection(zone_a=zone_a, zone_b=zone_b, max_link_capacity=cap)
 
-    # ------------------------------------------------------------------
-    # Metadata helpers
-    # ------------------------------------------------------------------
-
     def _extract_metadata(
-        self, rest: str, line_num: int
+        self, rest: str, line_num: int, allow_bracket_names: bool = False
     ) -> tuple[str, dict[str, str]]:
-        """Extract a single trailing metadata block from a line."""
+        """Extract a single trailing metadata block from a line.
+
+        A trailing '[...]' block is treated as metadata only if its contents
+        contain '='. Otherwise it is either silently kept as part of the
+        content (allow_bracket_names=True, used for connections) or rejected
+        as an error (allow_bracket_names=False, used for zone lines).
+
+        Raises:
+            ParseError: On missing whitespace separator, duplicate
+                        blocks, empty block, or invalid trailing
+                        bracket in zone context.
+        """
         rest = rest.strip()
-        match = re.search(r"(\[[^\[\]]*\])$", rest)
+        match = re.search(r"\[[^\[\]]*\]$", rest)
         if not match:
             return rest, {}
 
-        block = match.group(1)
-        before = rest[:match.start(1)]
+        block = match.group()
+        raw_meta = block[1:-1]
+
+        if "=" not in raw_meta:
+            if allow_bracket_names:
+                return rest, {}
+            raise ParseError(
+                line_num,
+                f"Invalid trailing block '{block}' — "
+                f"did you mean to add metadata like [key=value]?"
+            )
+
+        before = rest[:match.start()]
 
         if before and not before[-1].isspace():
             raise ParseError(
@@ -325,17 +395,15 @@ class MapParser:
                 line_num, "Duplicate metadata blocks are not allowed"
             )
 
-        raw_meta = block[1:-1]
-        if not raw_meta.strip():
-            raise ParseError(
-                line_num, "Empty metadata block '[]' is not allowed"
-            )
-
         return before, self._parse_metadata(raw_meta, line_num)
 
     @staticmethod
     def _parse_metadata(raw: str, line_num: int) -> dict[str, str]:
-        """Parse key=value pairs from a metadata block's inner content."""
+        """Parse key=value pairs from a metadata block's inner content.
+
+        Raises:
+            ParseError: On tokens missing '=', or empty key or value.
+        """
         meta: dict[str, str] = {}
         for token in raw.strip().split():
             if "=" not in token:
@@ -349,23 +417,34 @@ class MapParser:
                     line_num,
                     f"Empty key or value in metadata token '{token}'"
                 )
-            meta[key.strip()] = value.strip()
+            key = key.strip()
+            value = value.strip()
+            if key in meta:
+                raise ParseError(
+                    line_num,
+                    f"Duplicate metadata key '{key}' in block"
+                )
+            meta[key] = value
         return meta
 
-    # ------------------------------------------------------------------
-    # Graph helpers
-    # ------------------------------------------------------------------
-
     def _add_zone(self, zone: Zone, line_num: int) -> None:
+        """Add a zone to the graph, raising on duplicate names.
+
+        Raises:
+            ParseError: If a zone with the same name already exists.
+        """
         if self._graph.get_zone(zone.name) is not None:
-            raise ParseError(line_num, f"Duplicate zone name '{zone.name}'")
+            raise ParseError(
+                line_num, f"Duplicate zone name '{zone.name}'"
+            )
         self._graph.add_zone(zone)
 
-    # ------------------------------------------------------------------
-    # Post-parse validation
-    # ------------------------------------------------------------------
-
     def _validate_completeness(self) -> None:
+        """Verify that all required directives were present in the file.
+
+        Raises:
+            ParseError: If nb_drones, start_hub, or end_hub is missing.
+        """
         if not self._nb_drones_set:
             raise ParseError(0, "Missing required 'nb_drones:' definition")
         if not self._has_start:
@@ -374,10 +453,11 @@ class MapParser:
             raise ParseError(0, "Missing required 'end_hub:' definition")
 
 
-# ---------------------------------------------------------------------------
-# Convenience wrapper (backward-compatible with old parse_map() call sites)
-# ---------------------------------------------------------------------------
-
 def parse_map(filepath: str) -> Graph:
-    """Convenience wrapper around MapParser for backward compatibility."""
+    """Parse a map file and return its Graph (backward-compatible wrapper).
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ParseError: On any syntax or semantic error.
+    """
     return MapParser(filepath).parse()

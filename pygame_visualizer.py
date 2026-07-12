@@ -1,28 +1,22 @@
-"""FLY-IN · Blueprint Drone Routing Visualizer (Elite Mission Control Edition)
+"""FLY-IN · Blueprint Drone Routing Visualizer (Elite Mission Control Edition).
+
 Blueprint theme: Advanced Holographic Aerospace Mission Control Interface.
-Controls: SPACE pause | R restart | ←→ step | ↑↓ speed | scroll/drag=zoom/pan
+Controls: SPACE pause | R restart | ↑↓ speed | scroll/drag=zoom/pan
 | Q quit
 """
-from __future__ import annotations
 import math
 import time
 from typing import Optional
 import pygame
 
-try:
-    from models import Graph, Zone, ZoneType
-    from simulator import TurnAction
-except ImportError as e:
-    raise ImportError(
-        f"Needs models.py / simulator.py in same folder: {e}") from e
+from models import Graph, Zone, ZoneType
+from simulator import TurnAction
 
-# ── Types ──────────────────────────────────────────────────────────────
+
 RGB = tuple[int, int, int]
 Snap = dict[int, tuple[float, float, float, float, bool, bool]]
 
-# ── Palette ─────────────────────────────────────────────────────────────
-BG = (3, 5, 10)
-BG2 = (0, 0, 0)
+BG = (0, 0, 0)
 PANEL = (10, 16, 28)
 SEP = (20, 38, 64)
 SEP2 = (45, 75, 115)
@@ -57,96 +51,188 @@ _NAMED: dict[str, RGB] = {
     "crimson": (220,  20,  60), "darkred": (139,   0,   0),
 }
 
+ROT_SPEED = 2
+
 
 def _color_from_zone(z: Zone) -> Optional[RGB]:
+    """Return an explicit RGB colour for a zone if its colour name is known.
+
+    Args:
+        z: The zone to inspect.
+
+    Returns:
+        Optional[RGB]: Mapped colour tuple, or None if unknown/absent.
+    """
     name = getattr(z, 'color', None)
     return _NAMED.get(name.lower(), None) if name else None
 
 
-def zcol(z: Zone) -> tuple[RGB, RGB]:
+def zcol(z: Zone) -> RGB:
+    """Return border_colour for a zone node.
+
+    Args:
+        z: The zone to colour.
+
+    Returns:
+        RGB: colour.
+    """
     explicit = _color_from_zone(z)
     if explicit:
-        return explicit, BG2
+        return explicit
     if z.is_start:
-        return ORANGE, BG2
+        return ORANGE
     if z.is_end:
-        return RED, BG2
+        return RED
     if z.zone_type == ZoneType.PRIORITY:
-        return GREEN, BG2
+        return GREEN
     if z.zone_type == ZoneType.RESTRICTED:
-        return YELLOW, BG2
+        return YELLOW
     if z.zone_type == ZoneType.BLOCKED:
-        return WHITE3, BG2
-    return BLUE2, BG2
+        return WHITE3
+    return BLUE2
 
 
 def dcol(did: int) -> RGB:
+    """Return the display colour for a drone by its ID.
+
+    Args:
+        did: The drone's numeric ID (1-based).
+
+    Returns:
+        RGB: Colour tuple selected from the palette.
+    """
     return DRONE_COLS[(did - 1) % len(DRONE_COLS)]
 
 
 def lerp(a: float, b: float, t: float) -> float:
+    """Linearly interpolate between a and b by factor t.
+
+    Args:
+        a: Start value.
+        b: End value.
+        t: Interpolation factor in [0, 1].
+
+    Returns:
+        float: Interpolated value.
+    """
     return a + (b - a) * t
 
 
-def hex_pts(cx: int, cy: int, r: int) -> list[tuple[int, int]]:
-    return [(int(cx + r * math.cos(math.radians(60 * i))),
-             int(cy + r * math.sin(math.radians(60 * i)))) for i in range(6)]
-
-
-# ── Camera Matrix ───────────────────────────────────────────────────────
 class Camera:
+    """Manages pan and zoom for the world-to-screen transform.
+
+    Attributes:
+        x: Horizontal pan offset in pixels.
+        y: Vertical pan offset in pixels.
+        zoom: Pixels per world unit.
+    """
+
     def __init__(self) -> None:
+        """Initialise camera at origin with default zoom."""
         self.x = self.y = 0.0
         self.zoom = 50.0
         self._drag: Optional[tuple[int, int]] = None
         self._d0 = (0.0, 0.0)
 
-    def w2s(self, wx: float, wy: float, ox: int, oy: int) -> tuple[int, int]:
-        return (
-            int(wx * self.zoom + self.x) + ox,
-            int(wy * self.zoom + self.y) + oy,
-        )
+    def w2s(
+            self, wx: float, wy: float) -> tuple[int, int]:
+        """Convert world coordinates to screen coordinates.
 
-    def fit(self, xs: list[float], ys: list[float], vw: int, vh: int) -> None:
+        Args:
+            wx: World x coordinate.
+            wy: World y coordinate.
+
+        Returns:
+            tuple[int, int]: Screen (x, y) pixel position.
+        """
+        return (int(wx * self.zoom + self.x), int(wy * self.zoom + self.y))
+
+    def fit(
+        self, xs: list[int], ys: list[int], vw: int, vh: int
+    ) -> None:
+        """Fit all world points into the viewport with padding.
+
+        Args:
+            xs: World x coordinates of all nodes.
+            ys: World y coordinates of all nodes.
+            vw: Viewport width in pixels.
+            vh: Viewport height in pixels.
+        """
         if not xs:
             return
         rw = (max(xs) - min(xs)) or 1.0
         rh = (max(ys) - min(ys)) or 1.0
         self.zoom = min(vw / (rw * 1.4), vh / (rh * 1.4))
-
         self.x = vw / 2 - ((min(xs) + max(xs)) / 2) * self.zoom
         self.y = vh / 2 - ((min(ys) + max(ys)) / 2) * self.zoom
 
     def zoom_at(self, vx: int, vy: int, f: float) -> None:
-        nz = min(400.0, self.zoom * f)
+        """Zoom towards a viewport point by factor f.
+
+        Args:
+            vx: Viewport x of the zoom anchor.
+            vy: Viewport y of the zoom anchor.
+            f: Zoom scale factor (>1 zooms in, <1 zooms out).
+        """
+        nz = max(1, min(500.0, self.zoom * f))
         self.x = vx - (vx - self.x) * (nz / self.zoom)
         self.y = vy - (vy - self.y) * (nz / self.zoom)
         self.zoom = nz
 
     def start_drag(self, p: tuple[int, int]) -> None:
+        """Record the start of a mouse-drag pan.
+
+        Args:
+            p: Mouse position at drag start (viewport coordinates).
+        """
         self._drag = p
         self._d0 = (self.x, self.y)
 
     def drag(self, p: tuple[int, int]) -> None:
+        """Update pan offset during a mouse drag.
+
+        Args:
+            p: Current mouse position (viewport coordinates).
+        """
         if self._drag:
             self.x = self._d0[0] + (p[0] - self._drag[0])
             self.y = self._d0[1] + (p[1] - self._drag[1])
 
     def end_drag(self) -> None:
+        """End the active mouse-drag pan."""
         self._drag = None
 
 
-# ── Drone Asset ─────────────────────────────────────────────────────────
-# ── Constants (place near top of file, after palette) ──────────────────
-ROT_SPEED = 2   # radians per second of real time (tune freely)
-
-
-# ── Drone Asset ─────────────────────────────────────────────────────────
 class Drone:
+    """Animated drone sprite for the visualizer.
+
+    Attributes:
+        did: Drone numeric ID (1-based).
+        col: Display colour.
+        label: Human-readable label string.
+        x: Current world x position.
+        y: Current world y position.
+        heading: Current facing angle in radians.
+        target_heading: Desired facing angle.
+        wait_timer: Remaining real-time seconds in the wait phase.
+        waiting: True while the drone is pausing after arrival.
+        is_rotating: True while the drone is aligning its heading.
+        delivered: True once the drone has reached the end zone.
+        pending_delivery: True when delivery will be confirmed on arrival.
+        in_transit: True when traversing a restricted zone.
+        p: Visibility flag.
+    """
+
     def __init__(self, did: int, wx: float, wy: float) -> None:
+        """Initialise a drone sprite at a world position.
+
+        Args:
+            did: Drone numeric ID (1-based).
+            wx: Initial world x coordinate.
+            wy: Initial world y coordinate.
+        """
         self.did = did
         self.col = dcol(did)
-        self.label = f"UAV-{did}"
         self.x = wx
         self.y = wy
         self.heading = 0.0
@@ -162,7 +248,7 @@ class Drone:
         self._tx = wx
         self._ty = wy
         self._t = 1.0
-        self.p = True
+        self.next_heading = 0.0
 
     def move(
         self,
@@ -171,6 +257,17 @@ class Drone:
         transit: bool = False,
         next_heading: Optional[float] = None,
     ) -> None:
+        """Begin animated movement from (fx, fy) to (tx, ty).
+
+        Args:
+            fx: World x of the origin position.
+            fy: World y of the origin position.
+            tx: World x of the destination position.
+            ty: World y of the destination position.
+            transit: True if this hop crosses a restricted zone.
+            next_heading: If provided, the drone pre-aligns to this angle
+                          during its arrival wait phase.
+        """
         self._fx, self._fy = fx, fy
         self._tx, self._ty = tx, ty
         self._t = 0.0
@@ -178,72 +275,101 @@ class Drone:
         self.waiting = False
         self.is_rotating = False
 
-        dx, dy = tx - fx, ty - fy
-        if abs(dx) > 0.01 or abs(dy) > 0.01:
-            self.target_heading = math.atan2(dy, dx)
-
-        if next_heading is not None:
-            self.pre_align_heading = next_heading
-        else:
-            self.pre_align_heading = self.target_heading
+        self.next_heading = (
+            next_heading if next_heading is not None
+            else self.target_heading
+        )
 
     def tick(self, dt: float, speed: float) -> None:
-        PI = math.pi
-        TWO_PI = 2 * PI
-        SNAP_THRESH = 0.01  # radians — snap when this close
+        """Advance the drone animation by dt seconds at the given speed.
+
+        Phases in order:
+          1. Waiting (post-arrival pause, optional heading pre-alignment).
+          2. Pre-rotation (align heading before translating).
+          3. Translation (linear interpolation to destination).
+
+        Args:
+            dt: Elapsed real time in seconds since the last frame.
+            speed: Animation speed multiplier.
+        """
+        pi = math.pi
+        two_pi = 2 * pi
+        snap_thresh = 0.01
 
         def _rotate_toward(target: float, dt_: float) -> None:
-            """Rotate self.heading toward target by at most ROT_SPEED*dt_."""
-            diff = ((target - self.heading + PI) % TWO_PI) - PI
-            if abs(diff) <= SNAP_THRESH:
+            """Rotate self.heading toward target by at most ROT_SPEED*dt_.
+
+            Args:
+                target: Desired heading in radians.
+                dt_: Elapsed time slice in seconds.
+            """
+            diff = ((target - self.heading + pi) % two_pi) - pi
+            if abs(diff) <= snap_thresh:
                 self.heading = target
             else:
                 step = min(abs(diff), ROT_SPEED * dt_)
                 self.heading += math.copysign(step, diff)
 
-        # ── 1. Waiting phase ──────────────────────────────────────────────
         if self.waiting:
             self.is_rotating = True
-            _rotate_toward(self.pre_align_heading, dt)
-            self.wait_timer -= dt * speed
-            if self.wait_timer <= 0:
+            _rotate_toward(self.next_heading, dt)
+            self.wait_timer += dt * speed
+            if 1.0 <= self.wait_timer:
                 self.waiting = False
-                self.is_rotating = False
-                self.target_heading = self.pre_align_heading
+                self.target_heading = self.next_heading
             return
-        # ── 2. Pre-rotation phase (align before moving) ────────────────
-        diff = ((self.target_heading - self.heading + PI) % TWO_PI) - PI
-        if abs(diff) > SNAP_THRESH:
-            self.is_rotating = True
+
+        diff = ((self.target_heading - self.heading + pi) % two_pi) - pi
+        if abs(diff) > snap_thresh:
             _rotate_toward(self.target_heading, dt)
             return
 
         self.is_rotating = False
 
-        # ── 3. Translation phase ───────────────────────────────────────
         if self._t < 1.0:
             self._t = min(1.0, self._t + dt * speed)
             self.x = lerp(self._fx, self._tx, self._t)
             self.y = lerp(self._fy, self._ty, self._t)
 
-            if self._t >= 1.0:
+            if self._t == 1.0:
                 self.x, self.y = self._tx, self._ty
                 self.waiting = True
-                self.wait_timer = 0.45      # seconds of real time
+                self.wait_timer = 0.0
                 if self.pending_delivery:
                     self.delivered = True
                     self.pending_delivery = False
 
-    @property
     def moving(self) -> bool:
+        """True while the drone is translating or rotating.
+
+        Returns:
+            bool: Animation in progress.
+        """
         return self._t < 1.0 or self.is_rotating
 
 
-# ── Visualizer Core Engine ──────────────────────────────────────────────
 class PygameVisualizer:
-    BH = 200  # bottom panel height
+    """Turn-by-turn drone routing visualizer using pygame.
 
-    def __init__(self, graph: Graph, turns: list[list[TurnAction]]) -> None:
+    Renders the zone graph, animated drones, and a telemetry panel.
+    All simulation turns are pre-computed; the visualizer only animates.
+
+    Attributes:
+        BH: Height of the bottom telemetry panel in pixels.
+    """
+
+    BH = 200
+
+    def __init__(
+        self, graph: Graph, turns: list[list[TurnAction]]
+    ) -> None:
+        """Initialise the visualizer with a graph and pre-computed turns.
+
+        Args:
+            graph: The drone network graph.
+            turns: Ordered list of simulation turns, each a list of
+                   TurnAction objects.
+        """
         self._g = graph
         self._turns = turns
         self._total = len(turns)
@@ -251,7 +377,6 @@ class PygameVisualizer:
         self._paused = False
         self._finished = False
         self._speed = 1.0
-        self._timer = 0.0
         self._drones: dict[int, Drone] = {}
         self._glow: dict[frozenset[str], float] = {}
         self._log: list[tuple[str, RGB]] = []
@@ -260,86 +385,121 @@ class PygameVisualizer:
         self._dragging = False
         self._scr: Optional[pygame.Surface] = None
         self._clock: Optional[pygame.time.Clock] = None
-        self._fs: Optional[pygame.font.Font] = None
         self._fm: Optional[pygame.font.Font] = None
         self._fl: Optional[pygame.font.Font] = None
 
     def run(self) -> None:
+        """Open the pygame window and enter the main event loop.
+
+        Blocks until the user quits (Q key or window close).
+        """
         pygame.init()
-        self._scr = pygame.display.set_mode((1440, 880), pygame.RESIZABLE)
+        self._scr = pygame.display.set_mode(
+            (1540, 880), pygame.RESIZABLE
+        )
         pygame.display.set_caption(
             "FLY-IN  ·  MISSION CONTROL  ·  ELECTRONIC UAV ROUTING MATRIX"
         )
         self._clock = pygame.time.Clock()
-        self._fs = pygame.font.SysFont("monospace", 11)
         self._fm = pygame.font.SysFont("monospace", 13, bold=True)
         self._fl = pygame.font.SysFont("monospace", 17, bold=True)
+
+        assert self._scr is not None
+        assert self._clock is not None
+        assert self._fm is not None
+        assert self._fl is not None
+        assert self._g.start_zone is not None
+        assert self._g.end_zone is not None
+
         self._build_snaps()
         self._init_drones()
         self._fit()
         self._apply(0)
-
+        for d in self._drones.values():
+            dx, dy = d._tx - d._fx, d._ty - d._fy
+            if abs(dx) > 0.01 or abs(dy) > 0.01:
+                d.target_heading = math.atan2(dy, dx)
         clock = self._clock
 
         while True:
-
-            dt = min(clock.tick(60) / 1000.0, 0.05)
+            dt = clock.tick(60) / 1000.0
             if not self._events():
                 break
 
             for d in self._drones.values():
-                d.tick(dt, self._speed * 2.2)
+                d.tick(dt, self._speed)
 
             if not self._paused and not self._finished:
                 if all(
-                    not d.moving and not d.waiting
+                    not d.moving() and not d.waiting
                     for d in self._drones.values()
                 ):
-                    self._timer += dt
-                    if self._timer >= max(0.2, 0.75 / self._speed):
-                        self._timer = 0.0
-                        if self._idx < self._total - 1:
-                            self._idx += 1
-                            self._apply(self._idx)
-                        else:
-                            self._finished = True
-                            msg = (
-                                "OBJECTIVE ACHIEVED:"
-                                " ALL RECON FLIGHTS COMPLETED"
-                            )
-                            self._log_add(msg, GREEN)
-            for k in list(self._glow):
-                self._glow[k] -= dt
-                if self._glow[k] <= 0:
-                    self._glow.pop(k)
+
+                    if self._idx < self._total - 1:
+                        self._idx += 1
+                        self._apply(self._idx)
+                    else:
+                        self._finished = True
+                        msg = (
+                            "All drones reached their destinations."
+                        )
+                        self._log_add(msg, GREEN)
+
             self._draw()
+
         pygame.quit()
 
     def _vp(self) -> pygame.Rect:
+        """Return the viewport rect (window minus bottom panel).
+
+        Returns:
+            pygame.Rect: The drawable area above the telemetry panel.
+        """
         scr = self._scr
         assert scr is not None
         w, h = scr.get_size()
         return pygame.Rect(0, 0, w, h - self.BH)
 
     def _ws(self, wx: float, wy: float) -> tuple[int, int]:
-        vp = self._vp()
-        return self._cam.w2s(wx, wy, vp.x, vp.y)
+        """Convert world coords to screen coords within the viewport.
+
+        Args:
+            wx: World x coordinate.
+            wy: World y coordinate.
+
+        Returns:
+            tuple[int, int]: Screen pixel position.
+        """
+        return self._cam.w2s(wx, wy)
 
     def _fit(self) -> None:
+        """Fit the camera to all zone positions in the viewport."""
         vp = self._vp()
-        xs = [float(z.x) for z in self._g.zones.values()]
-        ys = [float(z.y) for z in self._g.zones.values()]
+        xs = [z.x for z in self._g.zones.values()]
+        ys = [z.y for z in self._g.zones.values()]
         self._cam.fit(xs, ys, vp.width, vp.height)
 
     def _build_snaps(self) -> None:
+        """Pre-compute per-turn drone position snapshots.
+
+        Each snapshot maps drone ID → (fx, fy, tx, ty, in_transit,
+        is_delivered).  Transit hops are split at the midpoint so the
+        animation moves to the centre on turn T and the destination on
+        turn T+1.
+        """
         assert self._g.start_zone is not None
         assert self._g.end_zone is not None
+
         end_name = self._g.end_zone.name
-        sx0, sy0 = float(self._g.start_zone.x), float(self._g.start_zone.y)
-        pos = {i: (sx0, sy0) for i in range(1, self._g.nb_drones + 1)}
+        sx0 = float(self._g.start_zone.x)
+        sy0 = float(self._g.start_zone.y)
+        pos: dict[int, tuple[float, float]] = {
+            i: (sx0, sy0) for i in range(1, self._g.nb_drones + 1)
+        }
         done: set[int] = set()
+
         for turn in self._turns:
-            snap = {
+            snap: Snap = {
                 i: (
                     pos[i][0], pos[i][1],
                     pos[i][0], pos[i][1],
@@ -366,23 +526,28 @@ class PygameVisualizer:
             self._snaps.append(snap)
 
     def _init_drones(self) -> None:
+        """Create Drone sprites at the start zone position."""
         assert self._g.start_zone is not None
-        sx, sy = float(self._g.start_zone.x), float(self._g.start_zone.y)
+        sx = float(self._g.start_zone.x)
+        sy = float(self._g.start_zone.y)
         for i in range(1, self._g.nb_drones + 1):
             self._drones[i] = Drone(i, sx, sy)
 
     def _apply(self, idx: int) -> None:
+        """Apply snapshot idx to all drone sprites and reset glow.
+
+        Args:
+            idx: Index into self._snaps to apply.
+        """
         if idx >= len(self._snaps):
             return
         snap = self._snaps[idx]
         next_snap = (
             self._snaps[idx + 1] if idx + 1 < len(self._snaps) else None
         )
-        self._glow.clear()
 
         for did, (fx, fy, tx, ty, tr, is_del) in snap.items():
-            if did not in self._drones:
-                continue
+
             d = self._drones[did]
 
             next_hdg: Optional[float] = None
@@ -396,53 +561,53 @@ class PygameVisualizer:
 
             if is_del and not d.delivered:
                 d.pending_delivery = True
-                self._log_add(f"UAV-{did} VECTOR DESTINATION REACHED", GREEN)
-
-            if fx != tx or fy != ty:
-                # look up zones by name from the turn action, not by coord
-                turn_actions = (
-                    self._turns[idx] if idx < len(self._turns) else []
+                self._log_add(
+                    f"Drone {did} reached the end zone.", GREEN
                 )
-                za_name = zb_name = None
-                for a in turn_actions:
-                    if a.drone.drone_id == did:
-                        zb_name = a.moved_to.name
-                        # from-zone: find which zone sits at (fx, fy)
-                        za = self._zat(fx, fy)
-                        za_name = za.name if za else None
-                        break
-                if za_name and zb_name:
-                    self._glow[frozenset([za_name, zb_name])] = 1.3
-                else:
-                    # fallback for transit midpoints
-                    za, zb = self._zat(fx, fy), self._zat(tx, ty)
-                    if za and zb:
-                        self._glow[frozenset([za.name, zb.name])] = 1.3
 
     def _restart(self) -> None:
+        """Reset the visualizer to turn 0."""
         assert self._g.start_zone is not None
         self._idx = 0
         self._finished = False
-        self._timer = 0.0
-        self._glow.clear()
         self._log.clear()
-        sx, sy = float(self._g.start_zone.x), float(self._g.start_zone.y)
+        sx = self._g.start_zone.x
+        sy = self._g.start_zone.y
         for d in self._drones.values():
             d.x = d._fx = d._tx = sx
             d.y = d._fy = d._ty = sy
             d._t = 1.0
             d.delivered = d.in_transit = d.pending_delivery = False
         self._apply(0)
-        self._log_add("SYSTEM THERMAL RESET REBOOT COMPLETE", ORANGE)
+        for d in self._drones.values():
+            dx, dy = d._tx - d._fx, d._ty - d._fy
+            if abs(dx) > 0 or abs(dy) > 0:
+                d.target_heading = math.atan2(dy, dx)
+        self._log_add("SYSTEM REBOOT COMPLETE", ORANGE)
 
     def _zat(self, x: float, y: float) -> Optional[Zone]:
+        """Return the zone whose world position is exactly (x, y).
+
+        Args:
+            x: World x coordinate.
+            y: World y coordinate.
+
+        Returns:
+            Optional[Zone]: Matching zone, or None if not found.
+        """
         for z in self._g.zones.values():
             if z.x - x == 0 and z.y - y == 0:
                 return z
         return None
 
     def _log_add(self, msg: str, col: RGB) -> None:
-        self._log.insert(0, (f"{time.strftime('%H:%M:%S')} ❯ {msg}", col))
+        """Prepend a timestamped entry to the comms log.
+
+        Args:
+            msg: Log message text.
+            col: Display colour for the message.
+        """
+        self._log.insert(0, (f"{time.strftime('%H:%M:%S')} -> {msg}", col))
         if len(self._log) > 12:
             self._log.pop()
 
@@ -454,21 +619,33 @@ class PygameVisualizer:
         font: pygame.font.Font,
         col: RGB,
     ) -> None:
-        scr = self._scr
-        if scr is None:
-            return
-        s = font.render(text, True, col)
+        """Blit a text string to the screen surface.
 
-        scr.blit(s, (x, y))
+        Args:
+            text: String to render.
+            x: Screen x position.
+            y: Screen y position.
+            font: pygame Font to use.
+            col: Text colour.
+        """
+        scr = self._scr
+        assert scr is not None
+
+        scr.blit(font.render(text, True, col), (x, y))
 
     def _events(self) -> bool:
+        """Process all pending pygame events.
+
+        Returns:
+            bool: False if the application should quit, True otherwise.
+        """
         vp = self._vp()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return False
             elif ev.type == pygame.KEYDOWN:
                 k = ev.key
-                if k in (pygame.K_q, pygame.K_ESCAPE):
+                if k == pygame.K_q:
                     return False
                 elif k == pygame.K_SPACE:
                     self._paused = not self._paused
@@ -481,7 +658,8 @@ class PygameVisualizer:
                 elif k == pygame.K_f:
                     self._fit()
             elif ev.type == pygame.MOUSEBUTTONDOWN:
-                vx, vy = ev.pos[0] - vp.x, ev.pos[1] - vp.y
+                vx = ev.pos[0] - vp.x
+                vy = ev.pos[1] - vp.y
                 if ev.button == 1 and vp.collidepoint(ev.pos):
                     self._dragging = True
                     self._cam.start_drag((vx, vy))
@@ -494,19 +672,21 @@ class PygameVisualizer:
                     self._dragging = False
                     self._cam.end_drag()
             elif ev.type == pygame.MOUSEMOTION and self._dragging:
-                vp2 = self._vp()
-                self._cam.drag((ev.pos[0] - vp2.x, ev.pos[1] - vp2.y))
+                self._cam.drag(
+                    (ev.pos[0], ev.pos[1])
+                )
             elif ev.type == pygame.VIDEORESIZE:
                 self._fit()
         return True
 
     def _draw(self) -> None:
+        """Render one complete frame to the screen."""
         scr = self._scr
         assert scr is not None
         w, h = scr.get_size()
         vp = self._vp()
         scr.fill(BG)
-        pygame.draw.rect(scr, BG2, vp)
+        pygame.draw.rect(scr, BG, vp)
         scr.set_clip(vp)
 
         self._draw_edges()
@@ -515,17 +695,19 @@ class PygameVisualizer:
         scr.set_clip(None)
         self._draw_bottom(w, h)
 
-        pygame.draw.line(scr, ORANGE, (0, h - self.BH), (w, h - self.BH), 2)
+        pygame.draw.line(
+            scr, ORANGE, (0, h - self.BH), (w, h - self.BH), 2
+        )
         pygame.display.flip()
 
     def _draw_edges(self) -> None:
+        """Draw all zone-to-zone connections onto the viewport."""
         scr = self._scr
         assert scr is not None
         for conn in self._g.connections:
             za, zb = conn.zone_a, conn.zone_b
-            ax, ay = self._ws(float(za.x), float(za.y))
-            bx, by = self._ws(float(zb.x), float(zb.y))
-            glow = self._glow.get(frozenset([za.name, zb.name]), 0.0)
+            ax, ay = self._ws(za.x, za.y)
+            bx, by = self._ws(zb.x, zb.y)
             is_blk = (
                 za.zone_type == ZoneType.BLOCKED
                 or zb.zone_type == ZoneType.BLOCKED
@@ -538,156 +720,131 @@ class PygameVisualizer:
             if is_blk:
                 mx = (ax + bx) // 2
                 my = (ay + by) // 2
-                pygame.draw.line(scr, GREY, (ax, ay), (bx, by), 2)
-                pygame.draw.circle(scr, RED, (mx, my), 12)
-                pygame.draw.circle(scr, BG, (mx, my), 10)
+                pygame.draw.line(scr, GREY, (ax, ay), (bx, by), 3)
+                pygame.draw.circle(scr, RED, (mx, my), 12, 2)
                 pygame.draw.line(
-                    scr, RED, (mx - 7, my - 7), (mx + 7, my + 7), 3)
+                    scr, RED, (mx - 7, my - 7), (mx + 7, my + 7), 3
+                )
                 pygame.draw.line(
-                    scr, RED, (mx + 7, my - 7), (mx - 7, my + 7), 3)
-
+                    scr, RED, (mx + 7, my - 7), (mx - 7, my + 7), 3
+                )
                 continue
 
-            if glow > 0.01:
-                g_factor = min(1.0, glow)
-                col = tuple(
-                    max(0, min(255, int(lerp(BLUE2[i], BLUE[i], g_factor))))
-                    for i in range(3)
-                )
-                pygame.draw.line(
-                    scr,
-                    (col[0] // 4, col[1] // 4, col[2] // 4),
-                    (ax, ay), (bx, by), int(2 + glow * 4) + 4,
-                )
-                pygame.draw.line(
-                    scr, col, (ax, ay), (bx, by),
-                    max(2, int(1 + glow * 3)),
-                )
-            else:
-                pygame.draw.line(
-                    scr,
-                    YELLOW if is_rst else SEP2,
-                    (ax, ay), (bx, by), 1,
-                )
+            pygame.draw.line(
+                scr,
+                YELLOW if is_rst else SEP2,
+                (ax, ay), (bx, by), 3,
+            )
 
     def _draw_nodes(self) -> None:
-        scr, fs, fm = self._scr, self._fs, self._fm
-        assert scr and fs and fm
+        """Draw all zone nodes with labels, capacity bars, and glow."""
+        scr, fm = self._scr, self._fm
+        assert scr is not None
+        assert fm is not None
 
         zdrones: dict[str, list[Drone]] = {}
-
         for d in self._drones.values():
             z = self._zat(d.x, d.y)
             if z:
                 zdrones.setdefault(z.name, []).append(d)
-        r = max(20, min(42, int(self._cam.zoom * .58)))
+
+        r = max(20, min(42, int(self._cam.zoom)))
 
         for name, zone in self._g.zones.items():
-
-            sx, sy = self._ws(float(zone.x), float(zone.y))
-            border, fill = zcol(zone)
+            node_bg = BG
+            if zone.color and zone.color.lower() == "black":
+                node_bg = GREY
+            zx, zy = self._ws(zone.x, zone.y)
+            border = zcol(zone)
 
             cnt = len(zdrones.get(name, []))
             cap = zone.max_drones
-
             is_full = (
                 not zone.is_start and not zone.is_end
                 and cap > 0 and cnt >= cap
             )
 
-            glow_col = (border[0]//6, border[1]//6, border[2]//6)
-
-            pygame.draw.circle(scr, glow_col, (sx, sy), r+14)
+            pygame.draw.circle(scr, node_bg, (zx, zy), r + 3)
 
             if is_full:
-                pulse_r = r + int(5 + 3*math.sin(time.time()*10))
-                pygame.draw.circle(scr, RED, (sx, sy), pulse_r, 2)
-
-            pygame.draw.circle(scr, border, (sx, sy), r + 4, 2)
-            pygame.draw.circle(scr, fill, (sx, sy), r)
-
-            core_col = (
-                min(255, border[0]+40),
-                min(255, border[1]+40),
-                min(255, border[2]+40)
-            )
-
-            pygame.draw.circle(scr, core_col, (sx, sy), int(r*.4))
+                pulse_r = r + int(5 + 3 * math.sin(time.time() * 10))
+                pygame.draw.circle(scr, RED, (zx, zy), pulse_r, 2)
+            pygame.draw.circle(scr, border, (zx, zy), r * .4)
+            pygame.draw.circle(scr, border, (zx, zy), r + 4, 2)
 
             lbl = fm.render(name, False, RED if is_full else WHITE)
-
-            offset = -r-20 if cnt else 0
-
+            offset = -r - 20 if cnt else 0
             scr.blit(
                 lbl,
-                (sx - lbl.get_width() // 2,
-                 sy - lbl.get_height() // 2 + offset)
+                (zx - lbl.get_width() // 2,
+                 zy - lbl.get_height() // 2 + offset),
             )
 
             if not zone.is_start and not zone.is_end and cap > 0:
-
-                bx, by = sx - r, sy + r + 10
+                bx, by = zx - r, zy + r + 10
                 bw, bh = r * 2, 5
-
-                pygame.draw.rect(scr, BG, (bx, by, bw, bh), border_radius=3)
-
+                pygame.draw.rect(
+                    scr, BG, (bx, by, bw, bh), border_radius=3
+                )
                 if cnt > 0:
                     fw = int(bw * min(cnt / cap, 1))
                     pygame.draw.rect(
                         scr,
                         RED if is_full else border,
                         (bx, by, fw, bh),
-                        border_radius=3
+                        border_radius=3,
                     )
-
                 pygame.draw.rect(
-                    scr, SEP2, (bx, by, bw, bh), 1, border_radius=3)
-
-                ct = fs.render(f"{cnt}/{cap}", True, WHITE3)
-
-                scr.blit(ct, (sx - ct.get_width() // 2, by + 8))
+                    scr, SEP2, (bx, by, bw, bh), 1, border_radius=3
+                )
+                ct = fm.render(f"{cnt}/{cap}", True, WHITE)
+                scr.blit(ct, (zx - ct.get_width() // 2, by + 8))
 
     def _draw_drones(self) -> None:
-        scr = self._scr
-        end_zone = self._g.end_zone
-        assert scr is not None and end_zone is not None
+        """Draw all drone sprites, grouping overlapping positions."""
+
         vp = self._vp()
-        r = max(8, min(16, int(self._cam.zoom * 0.22)))
+        r = max(8, min(16, int(self._cam.zoom)))
 
         groups: dict[tuple[int, int], list[Drone]] = {}
         for d in self._drones.values():
-            if not d.delivered:
-                groups.setdefault(self._ws(d.x, d.y), []).append(d)
+            groups.setdefault(
+                self._ws(d.x, d.y), []
+            ).append(d)
 
         for (sx, sy), group in groups.items():
             for i, d in enumerate(group):
                 gx, gy = sx, sy
                 if len(group) > 1:
                     a = 2 * math.pi * i / len(group)
-                    gx += int(math.cos(a) * r * 1.5)
-                    gy += int(math.sin(a) * r * 1.5)
+                    gx += int(math.cos(a) * r * 1.9)
+                    gy += int(math.sin(a) * r * 1.9)
                 if vp.collidepoint(gx, gy):
                     self._drone_dot(d, gx, gy, r)
 
-        ex, ey = self._ws(float(end_zone.x), float(end_zone.y))
-        deliv_fleet = [d for d in self._drones.values() if d.delivered]
-        for i, d in enumerate(deliv_fleet):
-            a = 2 * math.pi * i / max(len(deliv_fleet), 1)
-            dx2 = ex + int(math.cos(a) * r * 1.9)
-            dy2 = ey + int(math.sin(a) * r * 1.9)
-            if vp.collidepoint(dx2, dy2):
-                self._drone_dot(d, dx2, dy2, r)
+    def _drone_dot(
+        self, d: Drone, sx: int, sy: int, r: int
+    ) -> None:
+        """Render a single drone sprite at the given screen position.
 
-    def _drone_dot(self, d: Drone, sx: int, sy: int, r: int) -> None:
+        Draws four arms, spinning blades, a body core, heading indicator,
+        and a label.
+
+        Args:
+            d: The Drone to render.
+            sx: Screen x of the drone centre.
+            sy: Screen y of the drone centre.
+            r: Sprite radius in pixels.
+        """
         scr = self._scr
-        fs = self._fs
-        assert scr is not None and fs is not None
+        fm = self._fm
+        assert scr is not None
+        assert fm is not None
 
         heading = d.heading
         arm_len = r * 1.3
         blade_len = r * 0.6
         spin_angle = time.time() * 20.0
-
         for i in range(4):
             angle = heading + math.pi / 4 + i * math.pi / 2
             ax = sx + int(arm_len * math.cos(angle))
@@ -701,28 +858,33 @@ class PygameVisualizer:
             by2 = ay - int(blade_len * math.sin(b_angle))
             pygame.draw.line(scr, WHITE, (bx1, by1), (bx2, by2), 1)
 
-        core_col = (50, 15, 15)
-
+        core_col: RGB = (50, 15, 15)
         pygame.draw.circle(scr, core_col, (sx, sy), int(r * 0.6))
         pygame.draw.circle(scr, d.col, (sx, sy), int(r * 0.6), 2)
         node_x = sx + int(r * 0.4 * math.cos(heading))
         node_y = sy + int(r * 0.4 * math.sin(heading))
         pygame.draw.circle(scr, WHITE, (node_x, node_y), 3)
-        lbl = fs.render(f"D{d.did}", True, WHITE)
+        lbl = fm.render(f"D{d.did}", True, d.col)
         scr.blit(lbl, (sx - lbl.get_width() // 2, sy - r - 13))
 
-    # ── Bottom panel ────────────────────────────────────────────────────
     def _draw_bottom(self, w: int, h: int) -> None:
+        """Render the four-column telemetry panel at the bottom.
+
+        Columns: playback controls / scrubber, clock & metrics,
+        mission profile, comms log.
+
+        Args:
+            w: Total window width in pixels.
+            h: Total window height in pixels.
+        """
         scr = self._scr
-        fs = self._fs
         fm = self._fm
         fl = self._fl
         clock = self._clock
-        assert (
-            scr is not None and fs is not None
-            and fm is not None and fl is not None
-            and clock is not None
-        )
+        assert scr is not None
+        assert fm is not None
+        assert fl is not None
+        assert clock is not None
         assert self._g.start_zone is not None
         assert self._g.end_zone is not None
 
@@ -735,133 +897,150 @@ class PygameVisualizer:
         total_moves = sum(len(t) for t in self._turns)
         margin = 16
 
-        # four equal columns
-        C1 = w // 4
-        C2 = C1 * 2
-        C3 = C1 * 3
-        for cx in (C1, C2, C3):
+        c1 = w // 4
+        c2 = c1 * 2
+        c3 = c1 * 3
+        for cx in (c1, c2, c3):
             pygame.draw.line(scr, SEP2, (cx, ty + 6), (cx, h - 6), 2)
 
         x, y = margin, ty + margin
-        bar_w = C1 - margin * 2
+        bar_w = c1 - margin * 2
 
-        # status word
         if self._finished:
-            sc, st = GREEN,  "COMPLETE"
+            sc: RGB = GREEN
+            st = "COMPLETE"
         elif self._paused:
-            sc, st = YELLOW, "PAUSED"
+            sc = YELLOW
+            st = "PAUSED"
         else:
-            sc, st = BLUE,   "LIVE"
+            sc = BLUE
+            st = "LIVE"
         self._txt(st, x, y, fl, sc)
 
-        # turn counter right-aligned in same row
-        tc = fs.render(f"T -> {turn_d} / {self._total}", True, WHITE3)
+        tc = fm.render(f"T -> {turn_d} / {self._total}", True, WHITE)
         scr.blit(tc, (x + bar_w - tc.get_width(), y + 4))
 
-        # turn scrubber
         y += 24
-        cell_w = (bar_w - self._total) // max(self._total, 1)
+        cell_w = (bar_w - self._total) // self._total
+        required_width = self._total * cell_w + (self._total - 1)
         cell_h = 12
         for i in range(self._total):
-            if cell_w <= 0:
-                txt = "The number of turns is large"
-                scr.blit(fs.render(txt, False, RED), (x, y))
-            cx_cell = x + i * (cell_w + 1)
-            if cx_cell + cell_w > x + bar_w:
+            if required_width <= 0:
+                scr.blit(
+                    fm.render(
+                        "The number of turns is large", False, RED
+                    ),
+                    (x, y),
+                )
                 break
-            if i < self._idx:
-                pygame.draw.rect(scr, ORANGE2, (cx_cell, y, cell_w, cell_h))
-            elif i == self._idx:
-                pygame.draw.rect(scr, ORANGE,  (cx_cell, y, cell_w, cell_h))
-                pygame.draw.rect(scr, WHITE,   (cx_cell, y, cell_w, cell_h), 1)
-            else:
-                pygame.draw.rect(scr, BG,  (cx_cell, y, cell_w, cell_h))
-                pygame.draw.rect(scr, SEP, (cx_cell, y, cell_w, cell_h), 1)
+            cx_cell = x + i * (cell_w + 1)
 
-        # delivery progress bar + label
+            if i < self._idx:
+                pygame.draw.rect(
+                    scr, ORANGE2, (cx_cell, y, cell_w, cell_h)
+                )
+            elif i == self._idx:
+                pygame.draw.rect(
+                    scr, ORANGE, (cx_cell, y, cell_w, cell_h)
+                )
+                pygame.draw.rect(
+                    scr, WHITE, (cx_cell, y, cell_w, cell_h), 1
+                )
+            else:
+                pygame.draw.rect(
+                    scr, BG, (cx_cell, y, cell_w, cell_h)
+                )
+                pygame.draw.rect(
+                    scr, SEP, (cx_cell, y, cell_w, cell_h), 1
+                )
+
         y += 18
         pygame.draw.rect(scr, BG,   (x, y, bar_w, 6))
         pygame.draw.rect(scr, SEP2, (x, y, bar_w, 6), 1)
         if deliv > 0:
-            pygame.draw.rect(scr, GREEN, (x, y, int(bar_w * deliv / nd), 6))
+            pygame.draw.rect(
+                scr, GREEN, (x, y, int(bar_w * deliv / nd), 6)
+            )
         _pct = int(100 * deliv / max(nd, 1))
-        self._txt(f"ARRIVALS  {deliv}/{nd}  ({_pct}%)", x, y + 9, fs, WHITE2)
-
-        # keybind
-        kb = fs.render(
-            "SPC:PAUSE  R:REBOOT  ↑↓:SPEED  F:FIT  Q:QUIT",
-            True, WHITE3,
+        self._txt(
+            f"ARRIVALS  {deliv}/{nd}  ({_pct}%)", x, y + 9, fm, WHITE2
         )
-        scr.blit(kb, (x, h - 14))
 
-        # ── COL 1 · Telemetry readouts ───────────────────────────────────
-        #   Large clock  /  zoom  /  speed  /  fps
-        x = C1 + margin
-        bar_w2 = C2 - C1 - margin * 2          # usable width of this column
-        mid = C1 + (C2 - C1) // 2           # horizontal centre of column
+        kb = fm.render(
+            "SPC:PAUSE R:REBOOT  ↑↓:SPEED  F:FIT Q:QUIT",
+            True, WHITE,
+        )
+        scr.blit(kb, (x, h - 24))
 
-        # big clock — centred, prominent
+        x = c1 + margin
+        bar_w2 = c2 - c1 - margin * 2
+        mid = c1 + (c2 - c1) // 2
+
         clock_str = time.strftime("%H:%M:%S")
         clk = fl.render(clock_str, True, WHITE)
         clock_y = ty + margin
         scr.blit(clk, (mid - clk.get_width() // 2, clock_y))
 
-        # thin rule under clock
         rule_y = clock_y + clk.get_height() + 6
-        pygame.draw.line(scr, SEP2, (x, rule_y), (x + bar_w2, rule_y), 2)
+        pygame.draw.line(
+            scr, SEP2, (x, rule_y), (x + bar_w2, rule_y), 2
+        )
 
-        # three metric rows: label left, value right
-        def _metric(label: str, value: str, row_y: int, vc: RGB) -> None:
-            lbl_s = fs.render(label, True, WHITE3)
-            val_s = fm.render(value,  True, vc)
+        def _metric(
+            label: str, value: str, row_y: int, vc: RGB
+        ) -> None:
+            """Render a left-label / right-value metric row.
+
+            Args:
+                label: Metric name string.
+                value: Metric value string.
+                row_y: Screen y for this row.
+                vc: Colour for the value text.
+            """
+            lbl_s = fm.render(label, True, WHITE3)
+            val_s = fm.render(value, True, vc)
             scr.blit(lbl_s, (x, row_y))
             scr.blit(val_s, (x + bar_w2 - val_s.get_width(), row_y))
 
         ry = rule_y + 10
-        ln = "-" * 31
-        _metric("ZOOM   " + ln, f"{self._cam.zoom:.0f} px", ry, BLUE)
+        _metric("ZOOM   ", f"{self._cam.zoom:.0f} px", ry, BLUE)
         ry += 28
-        _metric("SPEED  " + ln, f"{self._speed:.1f} ×", ry, ORANGE)
+        _metric("SPEED  ", f"× {self._speed:.1f}", ry, ORANGE)
         ry += 28
-        _metric("FPS    " + ln, f"{clock.get_fps():.0f}", ry, WHITE2)
+        _metric("FPS    ", f"{clock.get_fps():.0f}", ry, WHITE2)
 
-        # ── COL 2 · Mission profile ──────────────────────────────────────
-        x, y = C2 + margin, ty + margin
+        x, y = c2 + margin, ty + margin
         self._txt("MISSION PROFILE", x, y, fm, ORANGE)
         y += 20
-        pygame.draw.line(scr, SEP2, (x, y), (C3 - margin, y), 2)
+        pygame.draw.line(scr, SEP2, (x, y), (c3 - margin, y), 2)
         y += 8
 
-        col_w = (C3 - C2 - margin * 2) // 2 + 10
+        col_w = (c3 - c2 - margin * 2) // 2 + 10
         rows_data = [
-            ("ORIGIN", self._g.start_zone.name, ORANGE),
-            ("TARGET", self._g.end_zone.name, RED),
-            ("NODES", str(len(self._g.zones)), WHITE),
-            ("EDGES", str(len(self._g.connections)), WHITE),
-            ("FLEET", str(nd), BLUE),
-            ("MOVES", str(total_moves), WHITE),
+            ("ORIGIN",    self._g.start_zone.name, ORANGE),
+            ("TARGET",    self._g.end_zone.name,   RED),
+            ("NODES",     str(len(self._g.zones)),       WHITE),
+            ("EDGES",     str(len(self._g.connections)), WHITE),
+            ("FLEET",     str(nd),                       BLUE),
+            ("MOVES",     str(total_moves),              WHITE),
             ("AVG/DRONE", f"{total_moves / max(nd, 1):.1f}", WHITE),
         ]
-        for lbl, val, vc in rows_data:
+        for row_lbl, val, vc in rows_data:
             if y > h - 20:
                 break
-            scr.blit(fs.render(lbl, True, WHITE3), (x, y))
-            scr.blit(fs.render(val, True, vc), (x + col_w, y))
+            scr.blit(fm.render(row_lbl, True, WHITE3), (x, y))
+            scr.blit(fm.render(val, True, vc), (x + col_w, y))
             y += 14
 
         y += 4
         if y < h - 36:
-            sep_w = C3 - C2 - margin * 2
+            sep_w = c3 - c2 - margin * 2
             pygame.draw.line(scr, SEP, (x, y), (x + sep_w, y), 2)
             y += 6
         if int(time.time()) % 2:
-            scr.blit(
-                fs.render("SYSTEM ONLINE", True, GREEN),
-                (x, y)
-            )
+            scr.blit(fm.render("SYSTEM ONLINE", True, GREEN), (x, y))
 
-        # ── COL 3 · Comms log ────────────────────────────────────────────
-        x, y = C3 + margin, ty + margin
+        x, y = c3 + margin, ty + margin
         if x + 60 < w:
             self._txt("COM-LINK STREAM", x, y, fm, ORANGE)
             y += 20
@@ -870,5 +1049,5 @@ class PygameVisualizer:
             for msg, mc in self._log:
                 if y > h - 16:
                     break
-                scr.blit(fs.render(msg, True, mc), (x, y))
+                scr.blit(fm.render(msg, True, mc), (x, y))
                 y += 13

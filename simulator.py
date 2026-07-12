@@ -11,15 +11,10 @@ Implements all rules from Chapter VII of the subject:
   - Output format: D<ID>-<zone> or D<ID>-<conn_label> for in-transit
 """
 
-from __future__ import annotations
 from typing import Optional
 from models import Graph, Zone, Connection, Drone, DroneStatus
 from pathfinder import Path, find_k_shortest_paths, dijkstra
 
-
-# ---------------------------------------------------------------------------
-# Turn action
-# ---------------------------------------------------------------------------
 
 class TurnAction:
     """Records what a single drone does during one simulation turn."""
@@ -56,10 +51,6 @@ class TurnAction:
         return f"TurnAction({self.output_token()})"
 
 
-# ---------------------------------------------------------------------------
-# Route planner
-# ---------------------------------------------------------------------------
-
 class RoutePlanner:
     """Assigns an optimal path and departure turn to every drone.
 
@@ -85,12 +76,7 @@ class RoutePlanner:
         """Assign paths and departure turns to all drones (in place)."""
         shortest_paths = self._find_optimal_paths()
         capacities = [self._path_capacity(p) for p in shortest_paths]
-        spacings = [self._drone_spacing(p) for p in shortest_paths]
-        self._assign(shortest_paths, capacities, spacings)
-
-    # ------------------------------------------------------------------
-    # Path discovery
-    # ------------------------------------------------------------------
+        self._assign(shortest_paths, capacities)
 
     def _find_optimal_paths(self) -> list[Path]:
         start = self._graph.start_zone
@@ -112,22 +98,17 @@ class RoutePlanner:
         optimal = [p for p in all_paths if p.total_cost == min_cost]
         return optimal if optimal else [best]
 
-    # ------------------------------------------------------------------
-    # Assignment
-    # ------------------------------------------------------------------
-
     def _assign(
         self,
         paths: list[Path],
         capacities: list[int],
-        spacings: list[int],
     ) -> None:
         load = [0] * len(paths)
 
         for drone in self._drones:
-            idx = self._best_path_index(paths, capacities, spacings, load)
+            idx = self._best_path_index(paths, capacities, load)
             group = load[idx] // capacities[idx]
-            departure = group * spacings[idx]
+            departure = group
             load[idx] += 1
 
             drone.path_zones = list(paths[idx].zones)
@@ -140,12 +121,11 @@ class RoutePlanner:
     def _best_path_index(
         paths: list[Path],
         capacities: list[int],
-        spacings: list[int],
         load: list[int],
     ) -> int:
-        def _wait(i: int) -> tuple[int, int]:
-            w = (load[i] // capacities[i]) * spacings[i]
-            return (w, paths[i].total_cost)
+        def _wait(i: int) -> int:
+            w = (load[i] // capacities[i])
+            return w
 
         best = 0
         best_score = _wait(0)
@@ -156,31 +136,16 @@ class RoutePlanner:
                 best = i
         return best
 
-    # ------------------------------------------------------------------
-    # Capacity helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _path_capacity(path: Path) -> int:
         """Return the bottleneck capacity along a path."""
-        min_cap = 999
+        min_cap = float('inf')
         for zone in path.zones[1:-1]:
             min_cap = min(min_cap, zone.max_drones)
         for conn in path.connections:
             min_cap = min(min_cap, conn.max_link_capacity)
-        return min_cap if min_cap < 999 else 1
+        return int(min_cap)
 
-    @staticmethod
-    def _drone_spacing(path: Path) -> int:
-        """Return minimum departure gap for consecutive drones."""
-        if len(path.zones) <= 1:
-            return 1
-        return max(z.movement_cost() for z in path.zones[1:])
-
-
-# ---------------------------------------------------------------------------
-# Simulation
-# ---------------------------------------------------------------------------
 
 class Simulation:
     """Runs the turn-by-turn drone movement simulation.
@@ -193,16 +158,13 @@ class Simulation:
         assert graph.end_zone is not None
         self._graph = graph
         self._drones = drones
-        self._zone_occ: dict[str, int] = {}
+        self._drones_per_zone: dict[str, int] = {}
+        self._reserved: dict[str, int] = {}
 
-    # ------------------------------------------------------------------
-    # Turn execution
-    # ------------------------------------------------------------------
-
-    def _init_occupancy(self) -> None:
+    def _initialize_drones_per_zone(self) -> None:
         for drone in self._drones:
             n = drone.current_zone.name
-            self._zone_occ[n] = self._zone_occ.get(n, 0) + 1
+            self._drones_per_zone[n] = self._drones_per_zone.get(n, 0) + 1
 
     def _run_turn(
         self, active: list[Drone]
@@ -223,10 +185,6 @@ class Simulation:
         self._flush_occupancy(incoming, outgoing)
         return actions
 
-    # ------------------------------------------------------------------
-    # Transit phase
-    # ------------------------------------------------------------------
-
     def _resolve_transit(
         self,
         drones: list[Drone],
@@ -236,7 +194,12 @@ class Simulation:
         for drone in drones:
             dest = drone.transit_dest
             assert dest is not None
-            incoming[dest.name] = incoming.get(dest.name, 0) + 1
+            if not dest.is_end:
+                self._reserved[dest.name] -= 1
+                if self._reserved[dest.name] == 0:
+                    del self._reserved[dest.name]
+            if not dest.is_end:
+                incoming[dest.name] = incoming.get(dest.name, 0) + 1
             drone.current_zone = dest
             drone.status = DroneStatus.MOVING
             drone.transit_conn = None
@@ -246,10 +209,6 @@ class Simulation:
                 drone.status = DroneStatus.DELIVERED
             actions.append(TurnAction(drone, dest))
 
-    # ------------------------------------------------------------------
-    # Regular move phase
-    # ------------------------------------------------------------------
-
     def _resolve_moves(
         self,
         drones: list[Drone],
@@ -257,7 +216,6 @@ class Simulation:
         outgoing: dict[str, int],
         actions: list[TurnAction],
     ) -> None:
-        drones = self._sort_ready(drones)
         link_usage: dict[str, int] = {}
 
         for drone in drones:
@@ -265,7 +223,7 @@ class Simulation:
             if dest is None:
                 continue
             conn = drone.next_conn()
-            conn_key = conn.key() if conn is not None else ""
+            conn_key = conn.key()
 
             if not self._link_free(conn, conn_key, link_usage):
                 continue
@@ -283,32 +241,26 @@ class Simulation:
                     incoming, outgoing, link_usage, actions,
                 )
 
-    # ------------------------------------------------------------------
-    # Move helpers
-    # ------------------------------------------------------------------
-
     def _start_transit(
         self,
         drone: Drone,
         dest: Zone,
-        conn: Optional[Connection],
+        conn: Connection,
         conn_key: str,
         outgoing: dict[str, int],
         link_usage: dict[str, int],
         actions: list[TurnAction],
     ) -> None:
         cur = drone.current_zone.name
-        if not drone.current_zone.is_start:
-            outgoing[cur] = outgoing.get(cur, 0) + 1
-        if conn is not None:
-            link_usage[conn_key] = link_usage.get(conn_key, 0) + 1
+        outgoing[cur] = outgoing.get(cur, 0) + 1
+        link_usage[conn_key] = link_usage.get(conn_key, 0) + 1
 
-        lbl = (
-            conn.transit_label(drone.current_zone)
-            if conn is not None
-            else f"{drone.current_zone.name}-{dest.name}"
-        )
+        lbl = (conn.transit_label(drone.current_zone))
         drone.transit_conn = conn
+        if not dest.is_end:
+            self._reserved[dest.name] = (
+                self._reserved.get(dest.name, 0) + 1
+            )
         drone.transit_dest = dest
         drone.status = DroneStatus.IN_TRANSIT
         actions.append(TurnAction(drone, dest, lbl))
@@ -317,7 +269,7 @@ class Simulation:
         self,
         drone: Drone,
         dest: Zone,
-        conn: Optional[Connection],
+        conn: Connection,
         conn_key: str,
         incoming: dict[str, int],
         outgoing: dict[str, int],
@@ -325,23 +277,15 @@ class Simulation:
         actions: list[TurnAction],
     ) -> None:
         cur = drone.current_zone.name
-        if not drone.current_zone.is_start:
-            outgoing[cur] = outgoing.get(cur, 0) + 1
-        if not dest.is_end:
-            incoming[dest.name] = incoming.get(dest.name, 0) + 1
-        if conn is not None:
-            link_usage[conn_key] = link_usage.get(conn_key, 0) + 1
-
+        outgoing[cur] = outgoing.get(cur, 0) + 1
+        incoming[dest.name] = incoming.get(dest.name, 0) + 1
+        link_usage[conn_key] = link_usage.get(conn_key, 0) + 1
         drone.current_zone = dest
         drone.advance()
         drone.status = (
             DroneStatus.DELIVERED if dest.is_end else DroneStatus.MOVING
         )
         actions.append(TurnAction(drone, dest))
-
-    # ------------------------------------------------------------------
-    # Capacity checks
-    # ------------------------------------------------------------------
 
     def _link_free(
         self,
@@ -361,14 +305,11 @@ class Simulation:
     ) -> bool:
         if dest.is_end or dest.is_start:
             return True
-        current = self._zone_occ.get(dest.name, 0)
+        current = self._drones_per_zone.get(dest.name, 0)
         going_out = outgoing.get(dest.name, 0)
         coming_in = incoming.get(dest.name, 0)
-        return (current - going_out + coming_in) < dest.max_drones
-
-    # ------------------------------------------------------------------
-    # Occupancy flush
-    # ------------------------------------------------------------------
+        reserved = self._reserved.get(dest.name, 0)
+        return (current - going_out + coming_in + reserved) < dest.max_drones
 
     def _flush_occupancy(
         self,
@@ -376,38 +317,22 @@ class Simulation:
         outgoing: dict[str, int],
     ) -> None:
         for name, count in outgoing.items():
-            self._zone_occ[name] = max(
-                0, self._zone_occ.get(name, 0) - count
+            self._drones_per_zone[name] = max(
+                0, self._drones_per_zone.get(name, 0) - count
             )
         for name, count in incoming.items():
-            self._zone_occ[name] = self._zone_occ.get(name, 0) + count
+            self._drones_per_zone[name] = (
+                self._drones_per_zone.get(name, 0) + count
+            )
 
-    # ------------------------------------------------------------------
-    # Misc helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _sort_ready(drones: list[Drone]) -> list[Drone]:
-        drones = sorted(drones, key=lambda d: d.path_zones[-1].name)
-        return sorted(
-            drones,
-            key=lambda d: sum(
-                z.movement_cost() for z in d.path_zones[1:]
-            ),
-        )
-
-    # Departure turn tracking requires knowing the current turn number.
-    # We pass it via a small instance variable set at the top of run().
     def _current_turn_reached(self, drone: Drone) -> bool:
         return self._turn >= drone.departure_turn
 
     def run(self) -> list[list[TurnAction]]:
         """Execute the simulation and return per-turn action lists."""
-        self._init_occupancy()
+        self._initialize_drones_per_zone()
         all_turns: list[list[TurnAction]] = []
-        max_turns = 10 * max(len(self._drones), 1) * (
-            len(self._graph.zones) + 10
-        )
+        max_turns = 10 * len(self._drones) * len(self._graph.zones)
 
         for turn in range(max_turns):
             self._turn = turn
@@ -418,13 +343,8 @@ class Simulation:
             if actions:
                 actions.sort(key=lambda a: a.drone.drone_id)
                 all_turns.append(actions)
-
         return all_turns
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def build_and_run(
     graph: Graph,

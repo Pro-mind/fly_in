@@ -1,20 +1,30 @@
-
 nb_drones: 7
 
-start_hub: start 0 0
-end_hub: goal 0 0 [color=green]
+start_hub: T 0 0
+end_hub: goal 10 0 [ color=green ]
 
-hub: A 1 -2 [ max_drones=1 ]
-hub: B 3 -2 [color=red max_drones=1]
-hub: C 4 0 [ max_drones=3]
-hub: D 3 2 [ max_drones=1]
-hub: E 1 2 [ max_drones=1]
+hub: A 2 -2 
+hub: B 4 -2 [ max_drones=7]
+hub: C 6 -2 [ max_drones=10]
+hub: D 3 0 [ max_drones=3 color=green]
+hub: E 5 0 [ max_drones=1]
+hub: F 1 2 [ max_drones=2]
+hub: G 3 2 [ max_drones=2]
+hub: H 5 2 [ max_drones=2]
+hub: I 7 2 [ max_drones=2]
+hub: K 8 0 [ max_drones=1 zone=restricted]
 
 
-connection: start-A [max_link_capacity=1]
-connection: A-B [max_link_capacity=1]
-connection: B-C [max_link_capacity=1]
-connection: C-D [max_link_capacity=1]
-connection: D-E [max_link_capacity=1]
-
-connection: E-goal
+connection: T-A [max_link_capacity=2]
+connection: T-D [max_link_capacity=3]
+connection: T-F [max_link_capacity=3]
+connection: A-B [max_link_capacity=3]
+connection: B-C [max_link_capacity=3]
+connection: D-E [max_link_capacity=3]
+connection: F-G [max_link_capacity=3]
+connection: G-H [max_link_capacity=3]
+connection: H-I [max_link_capacity=3]
+connection: C-K [max_link_capacity=3]
+connection: E-K [max_link_capacity=3]
+connection: I-K [max_link_capacity=3]
+connection: K-goal [max_link_capacity=3]

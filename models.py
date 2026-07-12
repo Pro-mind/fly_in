@@ -1,6 +1,5 @@
 """Core data models for the Fly-in drone routing simulation."""
 
-from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
@@ -179,10 +178,10 @@ class Connection:
 class DroneStatus(Enum):
     """Lifecycle status of a drone in the simulation."""
 
-    WAITING = "waiting"        # Not yet departed (before departure_turn)
-    MOVING = "moving"          # Actively following its path
-    IN_TRANSIT = "in_transit"  # On a restricted-zone link (turn 1 of 2)
-    DELIVERED = "delivered"    # Has reached the end zone
+    WAITING = "waiting"
+    MOVING = "moving"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
 
 
 class Drone:
@@ -198,16 +197,10 @@ class Drone:
         self.drone_id = drone_id
         self.current_zone: Zone = start_zone
         self.status: DroneStatus = DroneStatus.WAITING
-        # Ordered path: zones[0] is start, zones[-1] is end
         self.path_zones: list[Zone] = []
-        # connections[i] is the edge from path_zones[i] to path_zones[i+1]
         self.path_connections: list[Connection] = []
-        # Index of the NEXT zone to move toward in path_zones
-        # Starts at 1 after path is assigned (index 0 = start zone)
         self.path_index: int = 1
-        # Simulation turn this drone is allowed to start moving
         self.departure_turn: int = 0
-        # Restricted-zone transit state
         self.transit_conn: Optional[Connection] = None
         self.transit_dest: Optional[Zone] = None
 
@@ -246,7 +239,7 @@ class Drone:
             return None
         return self.path_zones[self.path_index]
 
-    def next_conn(self) -> Optional[Connection]:
+    def next_conn(self) -> Connection:
         """Return the connection leading to the next zone in the path.
 
         connections[i] leads from path_zones[i] to path_zones[i+1],
@@ -257,8 +250,6 @@ class Drone:
             Optional[Connection]: Connection to traverse, or None.
         """
         idx = self.path_index - 1
-        if idx < 0 or idx >= len(self.path_connections):
-            return None
         return self.path_connections[idx]
 
     def advance(self) -> None:

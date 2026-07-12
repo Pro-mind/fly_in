@@ -3,25 +3,21 @@ MAP ?= map.txt
 
 .PHONY: install run debug clean lint lint-strict
 
-## Install project dependencies
 install:
-	pip install flake8 mypy --break-system-packages pygame
+	$(PYTHON) -m pip install flake8 mypy pygame
 
-## Run the simulation (use MAP=<path> to specify a map file)
 run:
 	$(PYTHON) main.py $(MAP)
 
-## Run in debug mode using pdb
 debug:
 	$(PYTHON) -m pdb main.py $(MAP)
 
-## Remove caches and temporary files
 clean:
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
-	find . -name "*.pyc" -delete 2>/dev/null || true
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
+	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null
+	find . -name "*.pyc" -delete 2>/dev/null
 
-## Run flake8 and mypy linting
+
 lint:
 	flake8 .
 	mypy . \
@@ -31,7 +27,7 @@ lint:
 		--disallow-untyped-defs \
 		--check-untyped-defs
 
-## Run strict mypy check
+
 lint-strict:
 	flake8 .
 	mypy . --strict
