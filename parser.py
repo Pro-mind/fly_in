@@ -66,6 +66,14 @@ class MapParser:
             raise FileNotFoundError(
                 f"Map file not found: '{self.filepath}'"
             )
+        except PermissionError:
+            raise PermissionError(
+                f"Permission denied when reading map file: '{self.filepath}'"
+            )
+        except OSError as exc:
+            raise OSError(
+                f"Could not read map file '{self.filepath}': {exc}"
+            )
 
     def _process_line(self, raw_line: str, line_num: int) -> None:
         """Strip and dispatch a single raw line to the appropriate handler.

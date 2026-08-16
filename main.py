@@ -54,6 +54,9 @@ class Simulation:
         except FileNotFoundError as exc:
             print(f"[ERROR] {exc}", file=sys.stderr)
             sys.exit(1)
+        except Exception as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            sys.exit(1)
 
         assert self._graph.start_zone is not None
         assert self._graph.end_zone is not None
